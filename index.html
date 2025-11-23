@@ -1,269 +1,907 @@
+<?php
+// PHP Hata Gösterimini kapatın (Üretim ortamı için önemlidir)
+// ini_set('display_errors', 0);
+// error_reporting(0);
+
+// --- ⚙️ Yapılandırma ---
+$downloadsDir = __DIR__ . '/downloads/';
+// 1 saat = 3600 saniye
+$cleanupAfterSeconds = 1 * 3600; 
+$serverBaseUrl = getServerBaseUrl();
+
+// downloads dizinini oluştur
+if (!is_dir($downloadsDir)) {
+    if (!mkdir($downloadsDir, 0755, true)) {
+        // Dizin oluşturulamadıysa ciddi bir hata ver
+        http_response_code(500);
+        die(json_encode(['error' => true, 'message' => '❌ Sunucu Hatası: İndirme dizini oluşturulamadı.']));
+    }
+}
+
+// --- 🧹 Eski Dosyaları Temizle ---
+$now = time();
+// İyileştirme: glob ile sadece .mp4 ve .json dosyalarını hedef al
+$files = array_merge(glob($downloadsDir . '*.mp4'), glob($downloadsDir . '*.json'));
+
+foreach ($files as $file) {
+    if (is_file($file) && ($now - filemtime($file) >= $cleanupAfterSeconds)) {
+        @unlink($file); // Hata olursa devam et
+    }
+}
+
+// --- 🚀 API İsteklerini Yönet (POST) ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['url'])) {
+    header('Content-Type: application/json');
+    
+    $tiktokUrl = $_POST['url'] ?? '';
+    
+    // URL Doğrulama
+    if (empty($tiktokUrl) || !preg_match('/https?:\/\/(www\.)?(vm\.|vt\.)?tiktok\.com\//i', $tiktokUrl)) {
+        echo json_encode(['error' => true, 'message' => '❌ Geçersiz TikTok URL formatı!']);
+        exit;
+    }
+    
+    $sessionId = uniqid('tt_', true); 
+    $cacheKey = hash('sha256', $tiktokUrl);
+    $cacheFile = $downloadsDir . $cacheKey . '.json';
+    
+    // 💾 Önbellekten Kontrol Et
+    if (file_exists($cacheFile)) {
+        $cachedData = json_decode(file_get_contents($cacheFile), true);
+        if ($cachedData && !empty($cachedData['result'])) {
+            // İndirme URL'sini güncel sunucu bilgileriyle yeniden oluştur
+            $cachedData['result']['download_url']['without_watermark'] = createDownloadUrl($cacheKey . '.mp4', $sessionId, $serverBaseUrl);
+            echo json_encode($cachedData);
+            exit;
+        }
+    }
+    
+    // Harici API'den Veri Çek
+    $apiUrl = "https://tiktok-dl.hazex.workers.dev/?url=" . urlencode($tiktokUrl);
+    
+    // stream_context_create ile daha güvenli ve ayarlanabilir HTTP isteği
+    $context = stream_context_create([
+        'http' => [
+            'timeout' => 10, // 10 saniye zaman aşımı
+            'ignore_errors' => true // Hata durumlarında bile response'u al
+        ]
+    ]);
+    
+    $response = file_get_contents($apiUrl, false, $context);
+    
+    if ($response === FALSE) {
+        // Hata durumunda (zaman aşımı, DNS hatası vb.)
+        echo json_encode(['error' => true, 'message' => '🔥 API bağlantı hatası! Sunucuya ulaşılamadı.']);
+        exit;
+    }
+    
+    $data = json_decode($response, true);
+    
+    // Veri alındıysa ve indirme linki varsa
+    if (isset($data['result']['download_url']['without_watermark'])) {
+        $videoUrl = $data['result']['download_url']['without_watermark'];
+        $videoFilename = $cacheKey . '.mp4';
+        $videoPath = $downloadsDir . $videoFilename;
+        
+        // Video dosyasını sunucuya indir (SSRF riski göz önünde bulundurulmalı)
+        $videoContent = file_get_contents($videoUrl);
+        
+        if ($videoContent === FALSE) {
+            echo json_encode(['error' => true, 'message' => '🚫 Video kaynağına ulaşılamadı veya indirme başarısız oldu.']);
+            exit;
+        }
+        
+        if (file_put_contents($videoPath, $videoContent) !== FALSE) {
+            // Başarılı indirme: İndirme URL'sini kendi sunucumuzun linkiyle değiştir
+            $data['result']['download_url']['without_watermark'] = createDownloadUrl($videoFilename, $sessionId, $serverBaseUrl);
+            
+            // Önbellek dosyasını kaydet
+            file_put_contents($cacheFile, json_encode($data));
+            
+            echo json_encode($data);
+            exit;
+        } else {
+            // Dosya yazma hatası
+            echo json_encode(['error' => true, 'message' => '🚨 Sunucu Hatası: İndirilen video kaydedilemedi.']);
+            exit;
+        }
+    }
+    
+    // API'den gelen ham cevabı döndür (Hata veya başka bir bilgi olabilir)
+    echo $response;
+    exit;
+}
+
+// --- 🔽 Dosya İndirmeyi Yönet (GET) ---
+if (isset($_GET['download']) && isset($_GET['file'])) {
+    
+    // GÜVENLİK İYİLEŞTİRMESİ: Dosya adını temizle ve dizin dışına çıkmasını engelle
+    $requestedFilename = basename($_GET['file']); 
+    // Yalnızca alfanümerik, tire, alt çizgi ve nokta içeren dosya adlarına izin ver
+    if (!preg_match('/^[\w-]+\.(mp4|json)$/i', $requestedFilename)) {
+        header('HTTP/1.0 400 Bad Request');
+        die("⚠️ Geçersiz dosya adı formatı!");
+    }
+    
+    $file = $downloadsDir . $requestedFilename;
+    
+    if (file_exists($file) && is_file($file)) {
+        $sessionId = $_GET['id'] ?? 'video';
+        
+        // Dosya türüne göre uygun header
+        $mime = 'application/octet-stream';
+        if (pathinfo($file, PATHINFO_EXTENSION) === 'mp4') {
+            $mime = 'video/mp4';
+        }
+        
+        header('Content-Type: ' . $mime);
+        header('Content-Description: File Transfer');
+        header('Content-Disposition: attachment; filename="Cesicoder.ru_TT_' . cleanSessionId($sessionId) . '.mp4"');
+        header('Content-Length: ' . filesize($file));
+        header('Cache-Control: must-revalidate');
+        header('Pragma: public');
+        
+        // Dosyayı çıktıla
+        readfile($file);
+        exit;
+    } else {
+        header('HTTP/1.0 404 Not Found');
+        echo "⚠️ İstenen dosya bulunamadı veya yetkisiz erişim!";
+        exit;
+    }
+}
+
+// --- 🛠️ Yardımcı Fonksiyonlar ---
+
+// Oturum kimliğini temizle (başlıkta güvenli kullanım için)
+function cleanSessionId(string $id): string {
+    return preg_replace('/[^a-zA-Z0-9_-]/', '', $id);
+}
+
+// Sunucu temel URL'sini oluştur
+function getServerBaseUrl(): string {
+    $protocol = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    
+    // Scriptin bulunduğu dizin yolunu al
+    $scriptPath = str_replace($_SERVER['DOCUMENT_ROOT'] ?? '', '', dirname($_SERVER['SCRIPT_FILENAME'] ?? '/'));
+    $scriptPath = '/' . ltrim($scriptPath, '/'); 
+    
+    return $protocol . '://' . $host . $scriptPath;
+}
+
+// İndirme URL'sini oluştur
+function createDownloadUrl(string $filename, string $sessionId, string $baseUrl): string {
+    return $baseUrl . '/?download=true&file=' . urlencode($filename) . '&id=' . urlencode($sessionId);
+}
+?>
+
 <!DOCTYPE html>
-<html lang="en">
+<html lang="tr">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Image Watermark Tool</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-  body { background:linear-gradient(135deg, #6a11cb 0%, #2575fc 100%); color:#333; min-height:100vh; padding:20px; }
-  .container { max-width:1200px; margin:0 auto; }
-  header { text-align:center; margin-bottom:30px; color:white; }
-  h1 { font-size:2.5rem; margin-bottom:10px; text-shadow:2px 2px 4px rgba(0,0,0,0.3); }
-  .app-container { display:center; flex-wrap:wrap; gap:20px; background:white; border-radius:15px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,0.2); }
-  .controls { flex:1; min-width:300px; padding:25px; background:#f9f9f9; }
-  .preview { flex:2; min-width:400px; padding:25px; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#eee; }
-  .section { margin-bottom:25px; }
-  h2 { font-size:1.4rem; margin-bottom:15px; color:#2575fc; border-bottom:2px solid #ddd; padding-bottom:8px; }
-  .upload-btn { display:inline-block; padding:12px 20px; background:#2575fc; color:white; border-radius:5px; cursor:pointer; transition:background 0.3s; margin-bottom:10px; text-align:center; width:100%; }
-  .upload-btn:hover { background:#1a67e8; }
-  .upload-btn i { margin-right:8px; }
-  input[type="file"] { display:none; }
-  select,input { width:100%; padding:12px; margin-bottom:15px; border:1px solid #ddd; border-radius:5px; font-size:1rem; }
-  .color-picker { display:; flex-wrap:wrap; gap:10px; margin-bottom:15px; }
-  .color-option { width:35px; height:35px; border-radius:5px; cursor:pointer; border:2px solid transparent; transition:transform 0.2s; }
-  .color-option:hover { transform:scale(1.1); }
-  .color-option.active { border-color:#2575fc; transform:scale(1.1); }
-  .position-selector { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:15px; }
-  .position-btn { padding:12px; background:#f1f1f1; border:1px solid #ddd; border-radius:5px; text-align:center; cursor:pointer; transition:all 0.2s; }
-  .position-btn:hover { background:#e9e9e9; }
-  .position-btn.active { background:#2575fc; color:white; border-color:#2575fc; }
-  .action-btn { display:block; width:100%; padding:15px; background:#6a11cb; color:white; border:none; border-radius:5px; font-size:1.1rem; cursor:pointer; transition:background 0.3s; margin-top:200px; }
-  .action-btn:hover { background:#5a0fb8; }
-  .preview-container { width:100%; max-width:1000px; height:500px; border:20px dashed #ccc; border-radius:100px; display:flex; align-items:center; justify-content:center; overflow:hidden; margin-bottom:100px; background:white; position:relative; }
-  canvas { max-width:100%; max-height:100%; }
-  .placeholder-text { color:#999; text-align:center; padding:20px; }
-  .footer { text-align:Right; margin-top:300px; color:white; }
-  .social-link { display:inline-block; margin-top:15px; padding:120px 205px; background:#25D366; color:white; text-decoration:none; border-radius:50px; font-weight:bold; transition:background 0.3s; }
-  .social-link:hover { background:#20bd5c; }
-  .social-link i { margin-right:80px; }
-  .brand { margin-top:200px; font-weight:bold; color:rgba(255,255,255,0.8); }
-  @media(max-width:768px){ .app-container{flex-direction:column;} .preview,.controls{min-width:100%;} }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚀 Cesicoder.ru TT Video İndirici | Ultra Hızlı ve Ücretsiz</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Montserrat:wght@800&display=swap">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
+    <style>
+        /* CSS kodları, modern ve ultra mega grafikli dizayn için olduğu gibi korunmuştur */
+        :root {
+            --primary: #FF0050;
+            --primary-light: #FF3373;
+            --secondary: #00F2EA;
+            --dark: #0f0f13;
+            --darker: #0a0a0d;
+            --light: #ffffff;
+            --gray: #252531;
+            --success: #00c853;
+            --error: #ff3b30;
+            --font-main: 'Poppins', sans-serif;
+            --font-heading: 'Montserrat', 'Poppins', sans-serif;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: var(--font-main);
+            background-color: var(--dark);
+            color: var(--light);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(255, 0, 80, 0.25) 0%, transparent 25%), /* Kırmızı Glow */
+                radial-gradient(circle at 90% 80%, rgba(0, 242, 234, 0.25) 0%, transparent 25%), /* Mavi Glow */
+                linear-gradient(to bottom, var(--dark), var(--darker));
+            overflow-x: hidden;
+            /* Ultra Mega Grafik İyileştirmesi: Hafif bir hareketli arka plan efekti */
+            background-size: 300% 300%;
+            animation: gradient-animation 20s ease infinite;
+        }
+        
+        @keyframes gradient-animation {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        .container {
+            width: 100%;
+            max-width: 750px; /* Biraz daha geniş */
+            margin: 0 auto;
+            padding: 3rem 1.5rem;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            z-index: 1;
+        }
+        
+        header {
+            width: 100%;
+            margin-bottom: 3rem;
+            text-align: center;
+        }
+        
+        .logo {
+            font-size: 4rem; /* Daha büyük logo */
+            font-weight: 900;
+            font-family: var(--font-heading);
+            background: linear-gradient(45deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin-bottom: 1rem;
+            display: inline-block;
+            text-shadow: 0 0 15px rgba(255, 0, 80, 0.5), 0 0 15px rgba(0, 242, 234, 0.5); /* Neon Gölge */
+        }
+        
+        .tagline {
+            font-size: 1.3rem;
+            color: rgba(255, 255, 255, 0.8);
+            margin-bottom: 2rem;
+            font-weight: 300;
+        }
+        
+        .download-card {
+            width: 100%;
+            background: rgba(255, 255, 255, 0.08); /* Daha belirgin transparanlık */
+            border-radius: 25px;
+            backdrop-filter: blur(20px);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            padding: 3rem;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+            margin-bottom: 2.5rem;
+            position: relative;
+        }
+        
+        .input-group {
+            position: relative;
+            margin-bottom: 2rem;
+        }
+        
+        .input-group i {
+            position: absolute;
+            left: 20px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--secondary); /* İkon rengini değiştir */
+            font-size: 1.2rem;
+        }
+        
+        input[type="text"] {
+            width: 100%;
+            padding: 1.4rem 1.4rem 1.4rem 60px; /* Padding artırıldı */
+            background: var(--darker);
+            border: 2px solid rgba(0, 242, 234, 0.5); /* Çerçeve rengi */
+            border-radius: 15px;
+            color: var(--light);
+            font-size: 1.1rem;
+            transition: all 0.4s ease;
+            box-shadow: inset 0 0 8px rgba(0, 242, 234, 0.2);
+        }
+        
+        input[type="text"]:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 10px 4px rgba(255, 0, 80, 0.4);
+            outline: none;
+            background-color: rgba(25, 25, 31, 0.9);
+        }
+        
+        .btn {
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            color: var(--darker);
+            border: none;
+            padding: 1.5rem 3rem; /* Padding artırıldı */
+            border-radius: 15px;
+            font-size: 1.2rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            width: 100%;
+            box-shadow: 0 8px 25px rgba(255, 0, 80, 0.5); /* Daha güçlü gölge */
+            text-transform: uppercase;
+        }
+        
+        .btn:hover {
+            transform: translateY(-5px) scale(1.02);
+            box-shadow: 0 12px 30px rgba(0, 242, 234, 0.6);
+            background: linear-gradient(90deg, var(--secondary), var(--primary));
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+            box-shadow: 0 5px 15px rgba(255, 0, 80, 0.3);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .preview-container {
+            width: 100%;
+            background: var(--gray);
+            border-radius: 20px;
+            padding: 2rem;
+            margin-top: 2.5rem;
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            gap: 1.5rem;
+            animation: fadeIn 0.7s cubic-bezier(0.25, 0.46, 0.45, 0.94) both;
+            border: 1px solid var(--secondary);
+            box-shadow: 0 0 20px rgba(0, 242, 234, 0.3);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .preview-video {
+            width: 100%;
+            max-width: 350px;
+            border-radius: 15px;
+            aspect-ratio: 9/16;
+            object-fit: cover;
+            background: var(--darker);
+            border: 4px solid var(--primary);
+            box-shadow: 0 5px 20px rgba(255, 0, 80, 0.5);
+        }
+        
+        .preview-container p {
+            font-size: 1.1rem;
+            font-weight: 500;
+            color: var(--secondary);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.03); opacity: 0.8; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        
+        .alert {
+            padding: 1.2rem;
+            border-radius: 12px;
+            margin-top: 2rem;
+            text-align: center;
+            display: none;
+            font-weight: 500;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            font-size: 1.05rem;
+        }
+        
+        .alert.error {
+            background-color: #ff3b30;
+            color: white;
+            border: 1px solid #d92121;
+        }
+        
+        .alert.success {
+            background-color: #00c853;
+            color: white;
+            border: 1px solid #00a043;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            border: 4px solid rgba(255,255,255,.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 0.8s ease-in-out infinite;
+            margin-left: 10px;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 0.95rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            margin-top: auto;
+        }
+        
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 2rem;
+            width: 100%;
+            margin-top: 3rem;
+        }
+        
+        .feature-card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 18px;
+            padding: 2rem;
+            text-align: center;
+            transition: all 0.3s ease;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-7px) scale(1.03);
+            background: rgba(255, 255, 255, 0.1);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+        }
+        
+        .feature-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            color: var(--primary);
+            text-shadow: 0 0 10px var(--primary-light);
+        }
+        
+        .feature-title {
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            font-size: 1.2rem;
+            color: var(--secondary);
+        }
+        
+        .feature-desc {
+            font-size: 0.95rem;
+            color: rgba(255, 255, 255, 0.75);
+        }
+        
+        /* Sosyal Medya İyileştirmesi */
+        .social-links {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            margin: 2.5rem 0;
+        }
+        
+        .social-link {
+            width: 55px;
+            height: 55px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.8rem;
+            color: white;
+            transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            box-shadow: 0 6px 15px rgba(0,0,0,0.3);
+            border: 2px solid white;
+        }
+        
+        .social-link:hover {
+            transform: scale(1.15) rotate(5deg);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.5);
+        }
+        
+        .social-link.youtube { background: linear-gradient(45deg, #FF0000, #ff4c4c); }
+        .social-link.telegram { background: linear-gradient(45deg, #0088cc, #00b0ff); }
+        .social-link.instagram { background: linear-gradient(45deg, #f09433, #dc2743); }
+        .social-link.tiktok { background: linear-gradient(45deg, #25F4EE, #000000); }
+
+        .paste-board {
+            /* Pano stilleri öncekiyle aynı, ancak daha uyumlu */
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.9);
+            backdrop-filter: blur(8px);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.4s ease;
+        }
+        
+        .paste-board.active {
+            opacity: 1;
+            pointer-events: all;
+        }
+        
+        .paste-board-content {
+            background: var(--darker);
+            padding: 3rem;
+            border-radius: 20px;
+            width: 90%;
+            max-width: 550px;
+            max-height: 80vh;
+            overflow-y: auto;
+            border: 2px solid var(--primary);
+            box-shadow: 0 0 30px rgba(255, 0, 80, 0.4);
+            position: relative;
+        }
+
+        .paste-board-content h3 {
+            color: var(--secondary);
+            margin-bottom: 1.5rem;
+            font-size: 1.5rem;
+            font-weight: 600;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            padding-bottom: 1rem;
+        }
+        
+        .paste-board-item {
+            background: rgba(255,255,255,0.1);
+            padding: 1rem 1.5rem;
+            margin-bottom: 1rem;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            word-break: break-all;
+            border-left: 5px solid var(--secondary);
+        }
+        
+        .paste-board-item:hover {
+            background: rgba(255,255,255,0.2);
+            transform: translateX(5px);
+        }
+        
+        .paste-board-close {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            font-size: 2.5rem;
+            cursor: pointer;
+            color: var(--primary);
+            transition: transform 0.2s;
+        }
+
+        .paste-board-close:hover {
+            transform: rotate(90deg);
+        }
+        
+        .paste-board-btn {
+            position: absolute;
+            right: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: linear-gradient(45deg, var(--secondary), var(--primary));
+            border: none;
+            color: var(--dark);
+            padding: 0.7rem 1.2rem;
+            border-radius: 10px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+        }
+
+        .paste-board-btn:hover {
+            opacity: 0.9;
+        }
+        
+        @media (max-width: 768px) {
+            .logo {
+                font-size: 3rem;
+            }
+            
+            .download-card {
+                padding: 2rem;
+                border-radius: 20px;
+            }
+            
+            .features {
+                grid-template-columns: 1fr;
+            }
+            
+            .paste-board-btn {
+                position: static;
+                transform: none;
+                margin-top: 1rem;
+                width: 100%;
+                justify-content: center;
+            }
+
+            .input-group i {
+                left: 15px;
+            }
+
+            input[type="text"] {
+                padding-left: 50px;
+            }
+        }
+    </style>
 </head>
 <body>
-<div class="container">
-  <header>
-    <h1>Image Watermark Tool</h1>
-    <p>Easily add custom watermarks to your images</p>
-  </header>
-
-  <div class="app-container">
-    <div class="controls">
-      <div class="section">
-        <h2>Upload Files</h2>
-        <label class="upload-btn">
-          <i class="fas fa-font"></i> Upload Font / ZIP
-          <input type="file" id="fontUpload" accept=".ttf,.otf,.woff,.woff2,.zip">
-        </label>
-        <label class="upload-btn">
-          <i class="fas fa-image"></i> Upload Image
-          <input type="file" id="imageUpload" accept="image/*">
-        </label>
-      </div>
-
-      <div class="section">
-        <h2>Watermark Settings</h2>
-        <input type="text" id="watermarkText" placeholder="Enter watermark text" value="Cesi WATERMARK">
-
-        <h3>Select Font</h3>
-        <select id="fontSelect">
-          <option value="Arial">Arial</option>
-          <option value="Verdana">Verdana</option>
-          <option value="Georgia">Georgia</option>
-          <option value="Times New Roman">Times New Roman</option>
-          <option value="Courier New">Courier New</option>
-        </select>
-
-        <h3>Font Size</h3>
-        <input type="range" id="fontSize" min="10" max="200" value="40">
-
-        <h3>Font Opacity</h3>
-        <input type="range" id="fontOpacity" min="0" max="1" step="0.01" value="0.7">
-
-        <h3>Select Color</h3>
-        <div class="color-picker" id="colorPicker">
-          <div class="color-option active" style="background-color:#FFFFFF;" data-color="#FFFFFF"></div>
-          <div class="color-option" style="background-color:#000000;" data-color="#000000"></div>
-          <div class="color-option" style="background-color:#FF0000;" data-color="#FF0000"></div>
-          <div class="color-option" style="background-color:#00FF00;" data-color="#00FF00"></div>
-          <div class="color-option" style="background-color:#0000FF;" data-color="#0000FF"></div>
-          <div class="color-option" style="background-color:#FFFF00;" data-color="#FFFF00"></div>
-          <div class="color-option" style="background-color:#FF00FF;" data-color="#FF00FF"></div>
-          <div class="color-option" style="background-color:#00FFFF;" data-color="#00FFFF"></div>
-          <div class="color-option" style="background-color:#FFA500;" data-color="#FFA500"></div>
-          <div class="color-option" style="background-color:#800080;" data-color="#800080"></div>
-          <div class="color-option" style="background-color:#808080;" data-color="#808080"></div>
-          <div class="color-option" style="background-color:#2E2E2E;" data-color="#2E2E2E"></div>
+    <div class="container animate__animated animate__fadeIn">
+        <header>
+            <div class="logo">TikTok Pro ✨</div>
+            <div class="tagline">🎬 En hızlı **Su Damgasız** TikTok video indirici | 💯 Ücretsiz | 🚀 **Ultra Hızlı**</div>
+        </header>
+        
+        <div class="download-card">
+            <div class="input-group">
+                <i class="fas fa-link"></i>
+                <input type="text" id="video-url" placeholder="TikTok video linkini yapıştırın...">
+                <button id="paste-board-btn" class="paste-board-btn">
+                    <i class="fas fa-paste"></i> Panodan Seç
+                </button>
+            </div>
+            
+            <button id="download-btn" class="btn" onclick="processVideo()">
+                <i class="fas fa-fire"></i>
+                <span id="download-text">Videoyu İndir</span>
+                <span id="loading-spinner" class="loading" style="display: none;"></span>
+            </button>
+            
+            <div id="alert-message" class="alert"></div>
+            
+            <div class="preview-container" id="preview-container">
+                <video controls class="preview-video" id="preview-video" poster=""></video>
+                <p>🎉 Video hazır! **Otomatik indirme** başlatılıyor...</p>
+            </div>
         </div>
-
-        <h3>Select Position</h3>
-        <div class="position-selector">
-          <div class="position-btn" data-position="top-left">Top Left</div>
-          <div class="position-btn" data-position="top">Top</div>
-          <div class="position-btn" data-position="top-right">Top Right</div>
-          <div class="position-btn" data-position="left">Left</div>
-          <div class="position-btn active" data-position="center">Center</div>
-          <div class="position-btn" data-position="right">Right</div>
-          <div class="position-btn" data-position="bottom-left">Bottom Left</div>
-          <div class="position-btn" data-position="bottom">Bottom</div>
-          <div class="position-btn" data-position="bottom-right">Bottom Right</div>
+        
+        <div class="social-links">
+            <a href="#" target="_blank" class="social-link youtube" title="YouTube"><i class="fab fa-youtube"></i></a>
+            <a href="#" target="_blank" class="social-link telegram" title="Telegram"><i class="fab fa-telegram"></i></a>
+            <a href="#" target="_blank" class="social-link instagram" title="Instagram"><i class="fab fa-instagram"></i></a>
+            <a href="#" target="_blank" class="social-link tiktok" title="TikTok"><i class="fab fa-tiktok"></i></a>
         </div>
-      </div>
-
-      <button class="action-btn" id="applyWatermark"><i class="fas fa-tint"></i> Apply Watermark</button>
-      <button class="action-btn" id="downloadImage" disabled><i class="fas fa-download"></i> Download Image</button>
+        
+        <div class="features">
+            <div class="feature-card">
+                <div class="feature-icon">⚡</div>
+                <div class="feature-title">Süper Hızlı İşlem</div>
+                <div class="feature-desc">Videoları anında işler ve saniyeler içinde indirir. **Beklemeye son!**</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">💧</div>
+                <div class="feature-title">Orijinal Kalite</div>
+                <div class="feature-desc">Videonuzu **su damgası olmadan**, en yüksek orijinal kalitede alın.</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🔒</div>
+                <div class="feature-title">Gizlilik Odaklı</div>
+                <div class="feature-desc">Linkleriniz ve indirdiğiniz dosyalar sunucumuzda **kalıcı olarak saklanmaz**.</div>
+            </div>
+        </div>
     </div>
-
-    <div class="preview">
-      <h2>Image Preview</h2>
-      <div class="preview-container">
-        <canvas id="previewCanvas"></canvas>
-        <div id="center" class="placeholder-text">
-          <i class=""></i>
-          <p></p>
+    
+    <div class="paste-board" id="paste-board">
+        <div class="paste-board-content">
+            <div class="paste-board-close" id="paste-board-close">
+                <i class="fas fa-times"></i>
+            </div>
+            <h3>Panodan Link Seçin 📋</h3>
+            <div id="paste-board-items">
+                <p style="color: rgba(255,255,255,0.7); font-style: italic;">Aktif bir TikTok linki panonuzda algılandığında burada görünecektir.</p>
+            </div>
         </div>
-      </div>
     </div>
-  </div>
+    
+    <footer>
+        <p>© 2023 **TikTok Pro İndirici** | Tüm hakları saklıdır. | Geliştirici: Cesicoder.ru</p>
+        <p>❤️ ile yapıldı, 🚀 ile güçlendirildi</p>
+    </footer>
+    
+    <script>
+        // JavaScript kodları korunmuş ve ufak düzeltmeler yapılmıştır
+        const videoUrlInput = document.getElementById('video-url');
+        const downloadBtn = document.getElementById('download-btn');
+        const downloadText = document.getElementById('download-text');
+        const loadingSpinner = document.getElementById('loading-spinner');
+        const previewContainer = document.getElementById('preview-container');
+        const previewVideo = document.getElementById('preview-video');
+        const alertMessage = document.getElementById('alert-message');
+        const pasteBoard = document.getElementById('paste-board');
+        const pasteBoardBtn = document.getElementById('paste-board-btn');
+        const pasteBoardClose = document.getElementById('paste-board-close');
+        const pasteBoardItems = document.getElementById('paste-board-items');
+        
+        // Pano butonu event listener
+        pasteBoardBtn.addEventListener('click', async () => {
+            if (!navigator.clipboard || !navigator.clipboard.read) {
+                showAlert('⚠️ Tarayıcınız Pano Okuma özelliğini desteklemiyor.', 'error');
+                return;
+            }
+            
+            try {
+                const clipboardItems = await navigator.clipboard.read();
+                pasteBoardItems.innerHTML = ''; // Öğeleri temizle
+                let linkFound = false;
 
-  <div class="footer">
-    <a href="https://www.instagram.com/cesicoder?igsh=MWh0dnZ6MzI2a2syNQ==" class="social-link" target="_blank">
-      <i class="fab fa-instagram"></i> TAKİP EDİN INSTAGRAM
-    </a>
-    <div class="brand">POWERED BY CESICODER</div>
-  </div>
-</div>
-
-<script>
-document.addEventListener('DOMContentLoaded', () => {
-  const fontUpload = document.getElementById('fontUpload');
-  const imageUpload = document.getElementById('imageUpload');
-  const fontSelect = document.getElementById('fontSelect');
-  const watermarkText = document.getElementById('watermarkText');
-  const fontSizeInput = document.getElementById('fontSize');
-  const fontOpacityInput = document.getElementById('fontOpacity');
-  const colorOptions = document.querySelectorAll('.color-option');
-  const positionButtons = document.querySelectorAll('.position-btn');
-  const applyButton = document.getElementById('applyWatermark');
-  const downloadButton = document.getElementById('downloadImage');
-  const previewCanvas = document.getElementById('previewCanvas');
-  const ctx = previewCanvas.getContext('2d');
-  const placeholder = document.getElementById('placeholder');
-
-  let selectedColor = '#FFFFFF';
-  let selectedPosition = 'center';
-  let uploadedImage = null;
-
-  colorOptions.forEach(option => {
-    option.addEventListener('click', () => {
-      colorOptions.forEach(opt => opt.classList.remove('active'));
-      option.classList.add('active');
-      selectedColor = option.dataset.color;
-      drawWatermark();
-    });
-  });
-
-  positionButtons.forEach(btn => {
-    btn.addEventListener('click', () => {
-      positionButtons.forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      selectedPosition = btn.dataset.position;
-      drawWatermark();
-    });
-  });
-
-  imageUpload.addEventListener('change', e => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      uploadedImage = new Image();
-      uploadedImage.onload = () => {
-        previewCanvas.width = uploadedImage.width;
-        previewCanvas.height = uploadedImage.height;
-        placeholder.style.display = 'none';
-        drawWatermark();
-        downloadButton.disabled = false;
-      };
-      uploadedImage.src = ev.target.result;
-    };
-    reader.readAsDataURL(file);
-  });
-
-  fontUpload.addEventListener('change', async e => {
-    const file = e.target.files[0];
-    if (!file) return;
-
-    const loadFont = async (name, blob) => {
-      const url = URL.createObjectURL(blob);
-      const font = new FontFace(name, `url(${url})`);
-      await font.load();
-      document.fonts.add(font);
-      const opt = document.createElement('option');
-      opt.value = name;
-      opt.textContent = name;
-      fontSelect.appendChild(opt);
-      fontSelect.value = name;
-      drawWatermark();
-    };
-
-    if (file.name.endsWith('.zip')) {
-      const zip = await JSZip.loadAsync(file);
-      for (const entryName in zip.files) {
-        const zipEntry = zip.files[entryName];
-        if (!zipEntry.dir && /\.(ttf|otf|woff2?)$/i.test(zipEntry.name)) {
-          const blob = await zipEntry.async('blob');
-          const fontName = zipEntry.name.replace(/\.[^/.]+$/, '');
-          await loadFont(fontName, blob);
+                for (const clipboardItem of clipboardItems) {
+                    for (const type of clipboardItem.types) {
+                        if (type === 'text/plain') {
+                            const blob = await clipboardItem.getType(type);
+                            const text = await blob.text();
+                            
+                            // Sadece TikTok linklerini göster
+                            if (text.match(/https?:\/\/(www\.)?(vm\.|vt\.)?tiktok\.com\//i)) {
+                                const item = document.createElement('div');
+                                item.className = 'paste-board-item';
+                                item.textContent = text;
+                                item.addEventListener('click', () => {
+                                    videoUrlInput.value = text;
+                                    pasteBoard.classList.remove('active');
+                                    showAlert('📋 Link panodan yapıştırıldı!', 'success');
+                                    videoUrlInput.focus(); // Odakla
+                                });
+                                pasteBoardItems.appendChild(item);
+                                linkFound = true;
+                            }
+                        }
+                    }
+                }
+                
+                if (!linkFound) {
+                    const noItem = document.createElement('p');
+                    noItem.style.color = 'var(--error)';
+                    noItem.textContent = 'Panoda geçerli bir TikTok linki bulunamadı 😢';
+                    pasteBoardItems.appendChild(noItem);
+                }
+                
+                pasteBoard.classList.add('active');
+                
+            } catch (err) {
+                console.error('Pano erişimi reddedildi:', err);
+                showAlert('⚠️ Pano erişimi reddedildi. Lütfen tarayıcı iznini kontrol edin.', 'error');
+            }
+        });
+        
+        // Pano kapatma butonu
+        pasteBoardClose.addEventListener('click', () => {
+            pasteBoard.classList.remove('active');
+        });
+        
+        // Pano dışına tıklandığında kapat
+        pasteBoard.addEventListener('click', (e) => {
+            if (e.target === pasteBoard) {
+                pasteBoard.classList.remove('active');
+            }
+        });
+        
+        function showAlert(message, type) {
+            alertMessage.innerHTML = message;
+            alertMessage.className = `alert ${type} animate__animated animate__fadeInDown`;
+            alertMessage.style.display = 'block';
+            
+            setTimeout(() => {
+                alertMessage.className = `alert ${type} animate__animated animate__fadeOutUp`;
+                setTimeout(() => {
+                    alertMessage.style.display = 'none';
+                }, 500); // fadeOutUp animasyonu süresi
+            }, 5000);
         }
-      }
-    } else {
-      await loadFont(file.name.replace(/\.[^/.]+$/, ''), file);
-    }
-  });
+        
+        async function processVideo() {
+            const link = videoUrlInput.value.trim();
+            
+            if (!link) {
+                showAlert('⚠️ Lütfen bir TikTok linki girin!', 'error');
+                return;
+            }
+            
+            if (!link.match(/https?:\/\/(www\.)?(vm\.|vt\.)?tiktok\.com\//i)) {
+                showAlert('❌ Geçersiz TikTok linki formatı!', 'error');
+                return;
+            }
+            
+            // Show loading state
+            downloadText.textContent = 'İşleniyor...';
+            loadingSpinner.style.display = 'inline-block';
+            downloadBtn.disabled = true;
+            previewContainer.style.display = 'none';
+            alertMessage.style.display = 'none'; // Alert'i gizle
+            
+            try {
+                const response = await fetch(window.location.href, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: `url=${encodeURIComponent(link)}`
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    showAlert(`❌ **Hata:** ${data.message}`, 'error');
+                } else if (data.result?.download_url?.without_watermark) {
+                    const downloadUrl = data.result.download_url.without_watermark;
 
-  applyButton.addEventListener('click', drawWatermark);
-  fontSizeInput.addEventListener('input', drawWatermark);
-  fontSelect.addEventListener('change', drawWatermark);
-  fontOpacityInput.addEventListener('input', drawWatermark);
+                    // Video önizleme linki (eğer varsa)
+                    const previewUrl = data.result.cover_url ?? data.result.video_url; 
+                    if(previewUrl) {
+                        previewVideo.src = downloadUrl;
+                        previewContainer.style.display = 'flex';
+                    } else {
+                        previewContainer.style.display = 'none';
+                    }
+                    
+                    // Auto download
+                    setTimeout(() => {
+                        const a = document.createElement('a');
+                        a.href = downloadUrl;
+                        // İndirme dosya adını sunucu belirlediği için a.download gerekmez, 
+                        // ancak fallback olarak eklenebilir.
+                        // a.download = `Cesicoder.ru_TT_${Date.now()}.mp4`; 
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        
+                        showAlert('✅ Video başarıyla indirildi ve otomatik indirme başlatıldı!', 'success');
+                    }, 1500);
+                } else {
+                    showAlert('⚠️ Video bilgileri API tarafından alınamadı veya indirme linki yok.', 'error');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                showAlert('🔥 Sunucuya bağlantıda veya işlemde kritik bir hata oluştu.', 'error');
+            } finally {
+                // Reset button
+                downloadText.textContent = 'Videoyu İndir';
+                loadingSpinner.style.display = 'none';
+                downloadBtn.disabled = false;
+            }
+        }
+        
+        // Allow pressing Enter key
+        videoUrlInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault(); // Varsayılan formu göndermeyi engelle
+                processVideo();
+            }
+        });
 
-  function drawWatermark() {
-    if (!uploadedImage) return;
-    ctx.clearRect(0,0,previewCanvas.width,previewCanvas.height);
-    ctx.drawImage(uploadedImage,0,0,previewCanvas.width,previewCanvas.height);
-    const fontSize = parseInt(fontSizeInput.value);
-    ctx.font = `bold ${fontSize}px '${fontSelect.value}'`;
-    ctx.fillStyle = selectedColor;
-    ctx.globalAlpha = parseFloat(fontOpacityInput.value);
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    let x=previewCanvas.width/2, y=previewCanvas.height/2;
-    const margin=20;
-    switch(selectedPosition){
-      case 'top-left': ctx.textAlign='left';ctx.textBaseline='top';x=margin;y=margin;break;
-      case 'top': ctx.textBaseline='top';x=previewCanvas.width/2;y=margin;break;
-      case 'top-right': ctx.textAlign='right';ctx.textBaseline='top';x=previewCanvas.width-margin;y=margin;break;
-      case 'left': ctx.textAlign='left';x=margin;y=previewCanvas.height/2;break;
-      case 'right': ctx.textAlign='right';x=previewCanvas.width-margin;y=previewCanvas.height/2;break;
-      case 'bottom-left': ctx.textAlign='left';ctx.textBaseline='bottom';x=margin;y=previewCanvas.height-margin;break;
-      case 'bottom': ctx.textBaseline='bottom';x=previewCanvas.width/2;y=previewCanvas.height-margin;break;
-      case 'bottom-right': ctx.textAlign='right';ctx.textBaseline='bottom';x=previewCanvas.width-margin;y=previewCanvas.height-margin;break;
-    }
-    ctx.fillText(watermarkText.value, x, y);
-    ctx.globalAlpha = 1;
-  }
-
-  downloadButton.addEventListener('click', () => {
-    if (!uploadedImage) return;
-    const link = document.createElement('a');
-    link.download = 'watermarked-image.png';
-    link.href = previewCanvas.toDataURL('image/png');
-    link.click();
-  });
-});
-</script>
+        // Sayfa yüklendiğinde linki panodan otomatik yapıştır
+        window.addEventListener('load', async () => {
+            if (navigator.clipboard && navigator.clipboard.readText) {
+                try {
+                    const text = await navigator.clipboard.readText();
+                    if (text.match(/https?:\/\/(www\.)?(vm\.|vt\.)?tiktok\.com\//i)) {
+                        videoUrlInput.value = text;
+                        showAlert('👋 Hoş geldiniz! TikTok linki panodan otomatik yapıştırıldı.', 'success');
+                    }
+                } catch (err) {
+                    // Pano erişim izni yoksa sessiz kal
+                }
+            }
+        });
+    </script>
 </body>
 </html>
