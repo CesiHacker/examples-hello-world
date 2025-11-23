@@ -1,192 +1,14 @@
-<?php
-// PHP Hata Gösterimini kapatın (Üretim ortamı için önemlidir)
-// ini_set('display_errors', 0);
-// error_reporting(0);
-
-// --- ⚙️ Yapılandırma ---
-$downloadsDir = __DIR__ . '/downloads/';
-// 1 saat = 3600 saniye
-$cleanupAfterSeconds = 1 * 3600; 
-$serverBaseUrl = getServerBaseUrl();
-
-// downloads dizinini oluştur
-if (!is_dir($downloadsDir)) {
-    if (!mkdir($downloadsDir, 0755, true)) {
-        // Dizin oluşturulamadıysa ciddi bir hata ver
-        http_response_code(500);
-        die(json_encode(['error' => true, 'message' => '❌ Sunucu Hatası: İndirme dizini oluşturulamadı.']));
-    }
-}
-
-// --- 🧹 Eski Dosyaları Temizle ---
-$now = time();
-// İyileştirme: glob ile sadece .mp4 ve .json dosyalarını hedef al
-$files = array_merge(glob($downloadsDir . '*.mp4'), glob($downloadsDir . '*.json'));
-
-foreach ($files as $file) {
-    if (is_file($file) && ($now - filemtime($file) >= $cleanupAfterSeconds)) {
-        @unlink($file); // Hata olursa devam et
-    }
-}
-
-// --- 🚀 API İsteklerini Yönet (POST) ---
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['url'])) {
-    header('Content-Type: application/json');
-    
-    $tiktokUrl = $_POST['url'] ?? '';
-    
-    // URL Doğrulama
-    if (empty($tiktokUrl) || !preg_match('/https?:\/\/(www\.)?(vm\.|vt\.)?tiktok\.com\//i', $tiktokUrl)) {
-        echo json_encode(['error' => true, 'message' => '❌ Geçersiz TikTok URL formatı!']);
-        exit;
-    }
-    
-    $sessionId = uniqid('tt_', true); 
-    $cacheKey = hash('sha256', $tiktokUrl);
-    $cacheFile = $downloadsDir . $cacheKey . '.json';
-    
-    // 💾 Önbellekten Kontrol Et
-    if (file_exists($cacheFile)) {
-        $cachedData = json_decode(file_get_contents($cacheFile), true);
-        if ($cachedData && !empty($cachedData['result'])) {
-            // İndirme URL'sini güncel sunucu bilgileriyle yeniden oluştur
-            $cachedData['result']['download_url']['without_watermark'] = createDownloadUrl($cacheKey . '.mp4', $sessionId, $serverBaseUrl);
-            echo json_encode($cachedData);
-            exit;
-        }
-    }
-    
-    // Harici API'den Veri Çek
-    $apiUrl = "https://tiktok-dl.hazex.workers.dev/?url=" . urlencode($tiktokUrl);
-    
-    // stream_context_create ile daha güvenli ve ayarlanabilir HTTP isteği
-    $context = stream_context_create([
-        'http' => [
-            'timeout' => 10, // 10 saniye zaman aşımı
-            'ignore_errors' => true // Hata durumlarında bile response'u al
-        ]
-    ]);
-    
-    $response = file_get_contents($apiUrl, false, $context);
-    
-    if ($response === FALSE) {
-        // Hata durumunda (zaman aşımı, DNS hatası vb.)
-        echo json_encode(['error' => true, 'message' => '🔥 API bağlantı hatası! Sunucuya ulaşılamadı.']);
-        exit;
-    }
-    
-    $data = json_decode($response, true);
-    
-    // Veri alındıysa ve indirme linki varsa
-    if (isset($data['result']['download_url']['without_watermark'])) {
-        $videoUrl = $data['result']['download_url']['without_watermark'];
-        $videoFilename = $cacheKey . '.mp4';
-        $videoPath = $downloadsDir . $videoFilename;
-        
-        // Video dosyasını sunucuya indir (SSRF riski göz önünde bulundurulmalı)
-        $videoContent = file_get_contents($videoUrl);
-        
-        if ($videoContent === FALSE) {
-            echo json_encode(['error' => true, 'message' => '🚫 Video kaynağına ulaşılamadı veya indirme başarısız oldu.']);
-            exit;
-        }
-        
-        if (file_put_contents($videoPath, $videoContent) !== FALSE) {
-            // Başarılı indirme: İndirme URL'sini kendi sunucumuzun linkiyle değiştir
-            $data['result']['download_url']['without_watermark'] = createDownloadUrl($videoFilename, $sessionId, $serverBaseUrl);
-            
-            // Önbellek dosyasını kaydet
-            file_put_contents($cacheFile, json_encode($data));
-            
-            echo json_encode($data);
-            exit;
-        } else {
-            // Dosya yazma hatası
-            echo json_encode(['error' => true, 'message' => '🚨 Sunucu Hatası: İndirilen video kaydedilemedi.']);
-            exit;
-        }
-    }
-    
-    // API'den gelen ham cevabı döndür (Hata veya başka bir bilgi olabilir)
-    echo $response;
-    exit;
-}
-
-// --- 🔽 Dosya İndirmeyi Yönet (GET) ---
-if (isset($_GET['download']) && isset($_GET['file'])) {
-    
-    // GÜVENLİK İYİLEŞTİRMESİ: Dosya adını temizle ve dizin dışına çıkmasını engelle
-    $requestedFilename = basename($_GET['file']); 
-    // Yalnızca alfanümerik, tire, alt çizgi ve nokta içeren dosya adlarına izin ver
-    if (!preg_match('/^[\w-]+\.(mp4|json)$/i', $requestedFilename)) {
-        header('HTTP/1.0 400 Bad Request');
-        die("⚠️ Geçersiz dosya adı formatı!");
-    }
-    
-    $file = $downloadsDir . $requestedFilename;
-    
-    if (file_exists($file) && is_file($file)) {
-        $sessionId = $_GET['id'] ?? 'video';
-        
-        // Dosya türüne göre uygun header
-        $mime = 'application/octet-stream';
-        if (pathinfo($file, PATHINFO_EXTENSION) === 'mp4') {
-            $mime = 'video/mp4';
-        }
-        
-        header('Content-Type: ' . $mime);
-        header('Content-Description: File Transfer');
-        header('Content-Disposition: attachment; filename="Cesicoder.ru_TT_' . cleanSessionId($sessionId) . '.mp4"');
-        header('Content-Length: ' . filesize($file));
-        header('Cache-Control: must-revalidate');
-        header('Pragma: public');
-        
-        // Dosyayı çıktıla
-        readfile($file);
-        exit;
-    } else {
-        header('HTTP/1.0 404 Not Found');
-        echo "⚠️ İstenen dosya bulunamadı veya yetkisiz erişim!";
-        exit;
-    }
-}
-
-// --- 🛠️ Yardımcı Fonksiyonlar ---
-
-// Oturum kimliğini temizle (başlıkta güvenli kullanım için)
-function cleanSessionId(string $id): string {
-    return preg_replace('/[^a-zA-Z0-9_-]/', '', $id);
-}
-
-// Sunucu temel URL'sini oluştur
-function getServerBaseUrl(): string {
-    $protocol = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https' : 'http';
-    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-    
-    // Scriptin bulunduğu dizin yolunu al
-    $scriptPath = str_replace($_SERVER['DOCUMENT_ROOT'] ?? '', '', dirname($_SERVER['SCRIPT_FILENAME'] ?? '/'));
-    $scriptPath = '/' . ltrim($scriptPath, '/'); 
-    
-    return $protocol . '://' . $host . $scriptPath;
-}
-
-// İndirme URL'sini oluştur
-function createDownloadUrl(string $filename, string $sessionId, string $baseUrl): string {
-    return $baseUrl . '/?download=true&file=' . urlencode($filename) . '&id=' . urlencode($sessionId);
-}
-?>
-
 <!DOCTYPE html>
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🚀 Cesicoder.ru TT Video İndirici | Ultra Hızlı ve Ücretsiz</title>
+    <title>🚀 Cesicoder.ru TT Video İndirici | JS Sürümü</title>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Montserrat:wght@800&display=swap">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
     <style>
-        /* CSS kodları, modern ve ultra mega grafikli dizayn için olduğu gibi korunmuştur */
+        /* --- CSS STYLES (Aynı Tasarım Korundu) --- */
         :root {
             --primary: #FF0050;
             --primary-light: #FF3373;
@@ -201,11 +23,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             --font-heading: 'Montserrat', 'Poppins', sans-serif;
         }
         
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         
         body {
             font-family: var(--font-main);
@@ -215,11 +33,10 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             display: flex;
             flex-direction: column;
             background-image: 
-                radial-gradient(circle at 10% 20%, rgba(255, 0, 80, 0.25) 0%, transparent 25%), /* Kırmızı Glow */
-                radial-gradient(circle at 90% 80%, rgba(0, 242, 234, 0.25) 0%, transparent 25%), /* Mavi Glow */
+                radial-gradient(circle at 10% 20%, rgba(255, 0, 80, 0.25) 0%, transparent 25%),
+                radial-gradient(circle at 90% 80%, rgba(0, 242, 234, 0.25) 0%, transparent 25%),
                 linear-gradient(to bottom, var(--dark), var(--darker));
             overflow-x: hidden;
-            /* Ultra Mega Grafik İyileştirmesi: Hafif bir hareketli arka plan efekti */
             background-size: 300% 300%;
             animation: gradient-animation 20s ease infinite;
         }
@@ -232,7 +49,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
 
         .container {
             width: 100%;
-            max-width: 750px; /* Biraz daha geniş */
+            max-width: 750px;
             margin: 0 auto;
             padding: 3rem 1.5rem;
             flex: 1;
@@ -242,14 +59,10 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             z-index: 1;
         }
         
-        header {
-            width: 100%;
-            margin-bottom: 3rem;
-            text-align: center;
-        }
+        header { width: 100%; margin-bottom: 3rem; text-align: center; }
         
         .logo {
-            font-size: 4rem; /* Daha büyük logo */
+            font-size: 4rem;
             font-weight: 900;
             font-family: var(--font-heading);
             background: linear-gradient(45deg, var(--primary), var(--secondary));
@@ -258,7 +71,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             color: transparent;
             margin-bottom: 1rem;
             display: inline-block;
-            text-shadow: 0 0 15px rgba(255, 0, 80, 0.5), 0 0 15px rgba(0, 242, 234, 0.5); /* Neon Gölge */
+            text-shadow: 0 0 15px rgba(255, 0, 80, 0.5), 0 0 15px rgba(0, 242, 234, 0.5);
         }
         
         .tagline {
@@ -270,7 +83,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
         
         .download-card {
             width: 100%;
-            background: rgba(255, 255, 255, 0.08); /* Daha belirgin transparanlık */
+            background: rgba(255, 255, 255, 0.08);
             border-radius: 25px;
             backdrop-filter: blur(20px);
             border: 2px solid rgba(255, 255, 255, 0.2);
@@ -280,25 +93,22 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             position: relative;
         }
         
-        .input-group {
-            position: relative;
-            margin-bottom: 2rem;
-        }
+        .input-group { position: relative; margin-bottom: 2rem; }
         
         .input-group i {
             position: absolute;
             left: 20px;
             top: 50%;
             transform: translateY(-50%);
-            color: var(--secondary); /* İkon rengini değiştir */
+            color: var(--secondary);
             font-size: 1.2rem;
         }
         
         input[type="text"] {
             width: 100%;
-            padding: 1.4rem 1.4rem 1.4rem 60px; /* Padding artırıldı */
+            padding: 1.4rem 1.4rem 1.4rem 60px;
             background: var(--darker);
-            border: 2px solid rgba(0, 242, 234, 0.5); /* Çerçeve rengi */
+            border: 2px solid rgba(0, 242, 234, 0.5);
             border-radius: 15px;
             color: var(--light);
             font-size: 1.1rem;
@@ -317,7 +127,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             background: linear-gradient(90deg, var(--primary), var(--secondary));
             color: var(--darker);
             border: none;
-            padding: 1.5rem 3rem; /* Padding artırıldı */
+            padding: 1.5rem 3rem;
             border-radius: 15px;
             font-size: 1.2rem;
             font-weight: 700;
@@ -328,7 +138,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             justify-content: center;
             gap: 12px;
             width: 100%;
-            box-shadow: 0 8px 25px rgba(255, 0, 80, 0.5); /* Daha güçlü gölge */
+            box-shadow: 0 8px 25px rgba(255, 0, 80, 0.5);
             text-transform: uppercase;
         }
         
@@ -338,17 +148,8 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             background: linear-gradient(90deg, var(--secondary), var(--primary));
         }
         
-        .btn:active {
-            transform: translateY(0);
-            box-shadow: 0 5px 15px rgba(255, 0, 80, 0.3);
-        }
-        
-        .btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-            box-shadow: none;
-        }
+        .btn:active { transform: translateY(0); box-shadow: 0 5px 15px rgba(255, 0, 80, 0.3); }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; box-shadow: none; }
         
         .preview-container {
             width: 100%;
@@ -405,17 +206,8 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             font-size: 1.05rem;
         }
         
-        .alert.error {
-            background-color: #ff3b30;
-            color: white;
-            border: 1px solid #d92121;
-        }
-        
-        .alert.success {
-            background-color: #00c853;
-            color: white;
-            border: 1px solid #00a043;
-        }
+        .alert.error { background-color: #ff3b30; color: white; border: 1px solid #d92121; }
+        .alert.success { background-color: #00c853; color: white; border: 1px solid #00a043; }
         
         .loading {
             display: inline-block;
@@ -428,9 +220,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             margin-left: 10px;
         }
         
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
+        @keyframes spin { to { transform: rotate(360deg); } }
         
         footer {
             text-align: center;
@@ -471,19 +261,9 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             text-shadow: 0 0 10px var(--primary-light);
         }
         
-        .feature-title {
-            font-weight: 700;
-            margin-bottom: 0.5rem;
-            font-size: 1.2rem;
-            color: var(--secondary);
-        }
+        .feature-title { font-weight: 700; margin-bottom: 0.5rem; font-size: 1.2rem; color: var(--secondary); }
+        .feature-desc { font-size: 0.95rem; color: rgba(255, 255, 255, 0.75); }
         
-        .feature-desc {
-            font-size: 0.95rem;
-            color: rgba(255, 255, 255, 0.75);
-        }
-        
-        /* Sosyal Medya İyileştirmesi */
         .social-links {
             display: flex;
             justify-content: center;
@@ -505,18 +285,13 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             border: 2px solid white;
         }
         
-        .social-link:hover {
-            transform: scale(1.15) rotate(5deg);
-            box-shadow: 0 10px 20px rgba(0,0,0,0.5);
-        }
-        
+        .social-link:hover { transform: scale(1.15) rotate(5deg); box-shadow: 0 10px 20px rgba(0,0,0,0.5); }
         .social-link.youtube { background: linear-gradient(45deg, #FF0000, #ff4c4c); }
         .social-link.telegram { background: linear-gradient(45deg, #0088cc, #00b0ff); }
         .social-link.instagram { background: linear-gradient(45deg, #f09433, #dc2743); }
         .social-link.tiktok { background: linear-gradient(45deg, #25F4EE, #000000); }
 
         .paste-board {
-            /* Pano stilleri öncekiyle aynı, ancak daha uyumlu */
             position: fixed;
             top: 0;
             left: 0;
@@ -534,10 +309,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             transition: opacity 0.4s ease;
         }
         
-        .paste-board.active {
-            opacity: 1;
-            pointer-events: all;
-        }
+        .paste-board.active { opacity: 1; pointer-events: all; }
         
         .paste-board-content {
             background: var(--darker);
@@ -572,10 +344,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             border-left: 5px solid var(--secondary);
         }
         
-        .paste-board-item:hover {
-            background: rgba(255,255,255,0.2);
-            transform: translateX(5px);
-        }
+        .paste-board-item:hover { background: rgba(255,255,255,0.2); transform: translateX(5px); }
         
         .paste-board-close {
             position: absolute;
@@ -587,9 +356,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             transition: transform 0.2s;
         }
 
-        .paste-board-close:hover {
-            transform: rotate(90deg);
-        }
+        .paste-board-close:hover { transform: rotate(90deg); }
         
         .paste-board-btn {
             position: absolute;
@@ -609,24 +376,12 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
         }
 
-        .paste-board-btn:hover {
-            opacity: 0.9;
-        }
+        .paste-board-btn:hover { opacity: 0.9; }
         
         @media (max-width: 768px) {
-            .logo {
-                font-size: 3rem;
-            }
-            
-            .download-card {
-                padding: 2rem;
-                border-radius: 20px;
-            }
-            
-            .features {
-                grid-template-columns: 1fr;
-            }
-            
+            .logo { font-size: 3rem; }
+            .download-card { padding: 2rem; border-radius: 20px; }
+            .features { grid-template-columns: 1fr; }
             .paste-board-btn {
                 position: static;
                 transform: none;
@@ -634,14 +389,8 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
                 width: 100%;
                 justify-content: center;
             }
-
-            .input-group i {
-                left: 15px;
-            }
-
-            input[type="text"] {
-                padding-left: 50px;
-            }
+            .input-group i { left: 15px; }
+            input[type="text"] { padding-left: 50px; }
         }
     </style>
 </head>
@@ -672,6 +421,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             <div class="preview-container" id="preview-container">
                 <video controls class="preview-video" id="preview-video" poster=""></video>
                 <p>🎉 Video hazır! **Otomatik indirme** başlatılıyor...</p>
+                <a id="manual-download-link" href="#" target="_blank" style="color: var(--secondary); text-decoration: underline; font-size: 0.9rem;">İndirme başlamadıysa buraya tıklayın</a>
             </div>
         </div>
         
@@ -696,7 +446,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             <div class="feature-card">
                 <div class="feature-icon">🔒</div>
                 <div class="feature-title">Gizlilik Odaklı</div>
-                <div class="feature-desc">Linkleriniz ve indirdiğiniz dosyalar sunucumuzda **kalıcı olarak saklanmaz**.</div>
+                <div class="feature-desc">Linkleriniz sunucuya gönderilmez, doğrudan tarayıcınızdan işlem yapılır.</div>
             </div>
         </div>
     </div>
@@ -719,7 +469,8 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
     </footer>
     
     <script>
-        // JavaScript kodları korunmuş ve ufak düzeltmeler yapılmıştır
+        // --- JAVASCRIPT LOGIC (Tamamen Client-Side) ---
+
         const videoUrlInput = document.getElementById('video-url');
         const downloadBtn = document.getElementById('download-btn');
         const downloadText = document.getElementById('download-text');
@@ -731,8 +482,23 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
         const pasteBoardBtn = document.getElementById('paste-board-btn');
         const pasteBoardClose = document.getElementById('paste-board-close');
         const pasteBoardItems = document.getElementById('paste-board-items');
+        const manualDownloadLink = document.getElementById('manual-download-link');
         
-        // Pano butonu event listener
+        // Yardımcı Fonksiyon: Uyarı Göster
+        function showAlert(message, type) {
+            alertMessage.innerHTML = message;
+            alertMessage.className = `alert ${type} animate__animated animate__fadeInDown`;
+            alertMessage.style.display = 'block';
+            
+            setTimeout(() => {
+                alertMessage.className = `alert ${type} animate__animated animate__fadeOutUp`;
+                setTimeout(() => {
+                    alertMessage.style.display = 'none';
+                }, 500);
+            }, 5000);
+        }
+
+        // Pano İşlemleri (Değişiklik yapılmadan korundu)
         pasteBoardBtn.addEventListener('click', async () => {
             if (!navigator.clipboard || !navigator.clipboard.read) {
                 showAlert('⚠️ Tarayıcınız Pano Okuma özelliğini desteklemiyor.', 'error');
@@ -741,7 +507,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
             
             try {
                 const clipboardItems = await navigator.clipboard.read();
-                pasteBoardItems.innerHTML = ''; // Öğeleri temizle
+                pasteBoardItems.innerHTML = ''; 
                 let linkFound = false;
 
                 for (const clipboardItem of clipboardItems) {
@@ -750,7 +516,6 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
                             const blob = await clipboardItem.getType(type);
                             const text = await blob.text();
                             
-                            // Sadece TikTok linklerini göster
                             if (text.match(/https?:\/\/(www\.)?(vm\.|vt\.)?tiktok\.com\//i)) {
                                 const item = document.createElement('div');
                                 item.className = 'paste-board-item';
@@ -759,7 +524,7 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
                                     videoUrlInput.value = text;
                                     pasteBoard.classList.remove('active');
                                     showAlert('📋 Link panodan yapıştırıldı!', 'success');
-                                    videoUrlInput.focus(); // Odakla
+                                    videoUrlInput.focus();
                                 });
                                 pasteBoardItems.appendChild(item);
                                 linkFound = true;
@@ -778,36 +543,17 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
                 pasteBoard.classList.add('active');
                 
             } catch (err) {
-                console.error('Pano erişimi reddedildi:', err);
-                showAlert('⚠️ Pano erişimi reddedildi. Lütfen tarayıcı iznini kontrol edin.', 'error');
+                console.error('Pano hatası:', err);
+                showAlert('⚠️ Pano erişimi reddedildi.', 'error');
             }
         });
         
-        // Pano kapatma butonu
-        pasteBoardClose.addEventListener('click', () => {
-            pasteBoard.classList.remove('active');
-        });
-        
-        // Pano dışına tıklandığında kapat
+        pasteBoardClose.addEventListener('click', () => pasteBoard.classList.remove('active'));
         pasteBoard.addEventListener('click', (e) => {
-            if (e.target === pasteBoard) {
-                pasteBoard.classList.remove('active');
-            }
+            if (e.target === pasteBoard) pasteBoard.classList.remove('active');
         });
         
-        function showAlert(message, type) {
-            alertMessage.innerHTML = message;
-            alertMessage.className = `alert ${type} animate__animated animate__fadeInDown`;
-            alertMessage.style.display = 'block';
-            
-            setTimeout(() => {
-                alertMessage.className = `alert ${type} animate__animated animate__fadeOutUp`;
-                setTimeout(() => {
-                    alertMessage.style.display = 'none';
-                }, 500); // fadeOutUp animasyonu süresi
-            }, 5000);
-        }
-        
+        // ANA İŞLEM FONKSİYONU
         async function processVideo() {
             const link = videoUrlInput.value.trim();
             
@@ -816,89 +562,98 @@ function createDownloadUrl(string $filename, string $sessionId, string $baseUrl)
                 return;
             }
             
+            // Regex kontrolü
             if (!link.match(/https?:\/\/(www\.)?(vm\.|vt\.)?tiktok\.com\//i)) {
                 showAlert('❌ Geçersiz TikTok linki formatı!', 'error');
                 return;
             }
             
-            // Show loading state
-            downloadText.textContent = 'İşleniyor...';
+            // UI Güncelleme: Yükleniyor
+            downloadText.textContent = 'API Bağlanıyor...';
             loadingSpinner.style.display = 'inline-block';
             downloadBtn.disabled = true;
             previewContainer.style.display = 'none';
-            alertMessage.style.display = 'none'; // Alert'i gizle
+            alertMessage.style.display = 'none';
+            
+            // API URL (Doğrudan istek)
+            const apiUrl = "https://tiktok-dl.hazex.workers.dev/?url=" + encodeURIComponent(link);
             
             try {
-                const response = await fetch(window.location.href, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: `url=${encodeURIComponent(link)}`
-                });
-                
+                const response = await fetch(apiUrl);
                 const data = await response.json();
                 
-                if (data.error) {
-                    showAlert(`❌ **Hata:** ${data.message}`, 'error');
-                } else if (data.result?.download_url?.without_watermark) {
-                    const downloadUrl = data.result.download_url.without_watermark;
-
-                    // Video önizleme linki (eğer varsa)
-                    const previewUrl = data.result.cover_url ?? data.result.video_url; 
-                    if(previewUrl) {
-                        previewVideo.src = downloadUrl;
-                        previewContainer.style.display = 'flex';
-                    } else {
-                        previewContainer.style.display = 'none';
-                    }
+                // API Başarılıysa
+                if (data.result && data.result.download_url && data.result.download_url.without_watermark) {
                     
-                    // Auto download
-                    setTimeout(() => {
+                    const downloadUrl = data.result.download_url.without_watermark;
+                    
+                    // Önizleme ayarla
+                    previewVideo.src = downloadUrl;
+                    previewContainer.style.display = 'flex';
+                    manualDownloadLink.href = downloadUrl; // Manuel indirme linki
+                    
+                    downloadText.textContent = 'İndiriliyor...';
+                    
+                    // --- DOSYAYI İNDİRME MANTIĞI (PHP olmadan) ---
+                    // 1. Yöntem: Fetch ile blob olarak çekip indirmeyi zorla
+                    // Eğer CORS hatası verirse catch bloğuna düşer ve 2. Yönteme geçer.
+                    try {
+                        const vidResponse = await fetch(downloadUrl);
+                        const blob = await vidResponse.blob();
+                        const url = window.URL.createObjectURL(blob);
+                        
                         const a = document.createElement('a');
-                        a.href = downloadUrl;
-                        // İndirme dosya adını sunucu belirlediği için a.download gerekmez, 
-                        // ancak fallback olarak eklenebilir.
-                        // a.download = `Cesicoder.ru_TT_${Date.now()}.mp4`; 
+                        a.style.display = 'none';
+                        a.href = url;
+                        a.download = `Cesicoder_TT_${Date.now()}.mp4`; // Dosya adı
                         document.body.appendChild(a);
                         a.click();
-                        document.body.removeChild(a);
                         
-                        showAlert('✅ Video başarıyla indirildi ve otomatik indirme başlatıldı!', 'success');
-                    }, 1500);
+                        window.URL.revokeObjectURL(url);
+                        document.body.removeChild(a);
+                        showAlert('✅ Video başarıyla indirildi!', 'success');
+                        
+                    } catch (downloadError) {
+                        console.warn('Blob indirme başarısız (Muhtemelen CORS), direkt link açılıyor...');
+                        // 2. Yöntem: Yeni sekmede aç (Fallback)
+                        window.open(downloadUrl, '_blank');
+                        showAlert('⚠️ Otomatik indirme tarayıcı tarafından engellendi. Video yeni sekmede açıldı, oradan kaydedebilirsiniz.', 'success');
+                    }
+
                 } else {
-                    showAlert('⚠️ Video bilgileri API tarafından alınamadı veya indirme linki yok.', 'error');
+                    showAlert('⚠️ Video bilgileri alınamadı veya link geçersiz.', 'error');
                 }
+                
             } catch (error) {
                 console.error('Error:', error);
-                showAlert('🔥 Sunucuya bağlantıda veya işlemde kritik bir hata oluştu.', 'error');
+                showAlert('🔥 API hatası! Bağlantı sağlanamadı.', 'error');
             } finally {
-                // Reset button
+                // UI Sıfırla
                 downloadText.textContent = 'Videoyu İndir';
                 loadingSpinner.style.display = 'none';
                 downloadBtn.disabled = false;
             }
         }
         
-        // Allow pressing Enter key
+        // Enter tuşu desteği
         videoUrlInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
-                e.preventDefault(); // Varsayılan formu göndermeyi engelle
+                e.preventDefault();
                 processVideo();
             }
         });
 
-        // Sayfa yüklendiğinde linki panodan otomatik yapıştır
+        // Sayfa yüklendiğinde panoyu kontrol et
         window.addEventListener('load', async () => {
             if (navigator.clipboard && navigator.clipboard.readText) {
                 try {
                     const text = await navigator.clipboard.readText();
                     if (text.match(/https?:\/\/(www\.)?(vm\.|vt\.)?tiktok\.com\//i)) {
                         videoUrlInput.value = text;
-                        showAlert('👋 Hoş geldiniz! TikTok linki panodan otomatik yapıştırıldı.', 'success');
+                        showAlert('👋 Hoş geldiniz! TikTok linki panodan algılandı.', 'success');
                     }
                 } catch (err) {
-                    // Pano erişim izni yoksa sessiz kal
+                    // Sessiz kal
                 }
             }
         });
